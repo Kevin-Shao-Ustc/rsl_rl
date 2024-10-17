@@ -7,6 +7,37 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
+from torchnssd import BiMamba2
+
+
+class MambaActor(nn.Module):
+    def __init__(
+        self, cin, cout, d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size, n_state_buffer,
+    ):
+        super(MambaActor, self).__init__()
+        self.bimamba2 = BiMamba2(
+            cin=cin, cout=cout, d_model=d_model, n_layer=n_layer, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim, chunk_size=chunk_size
+        )
+        self.output_linear = nn.Linear(n_state_buffer, 1)
+        self.n_state_buffer = n_state_buffer
+
+    def forward(self, x, buffer):
+        '''
+        x [batch_size, cin]
+        buffer [batch_size, cin, n_state_buffer]
+        y [batch_size, cout]
+        '''
+        # add the new input to the buffer
+        buffer = torch.cat([buffer, x.unsqueeze(2)], dim=2)
+        # remove the oldest input from the buffer
+        buffer = buffer[:, :, -self.n_state_buffer:]
+
+        # forward pass
+        y = self.bimamba2(buffer)  # y [batch_size, cout, n_state_buffer]
+        
+        y = self.output_linear(y).squeeze(2) # y [batch_size, cout]
+
+        return y, buffer
 
 
 class ActorCritic(nn.Module):
@@ -21,6 +52,7 @@ class ActorCritic(nn.Module):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         init_noise_std=1.0,
+        backbone="MAMBA",
         **kwargs,
     ):
         if kwargs:
@@ -31,19 +63,27 @@ class ActorCritic(nn.Module):
         super().__init__()
         activation = get_activation(activation)
 
-        mlp_input_dim_a = num_actor_obs
+        input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
         # Policy
-        actor_layers = []
-        actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
-        actor_layers.append(activation)
-        for layer_index in range(len(actor_hidden_dims)):
-            if layer_index == len(actor_hidden_dims) - 1:
-                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
-            else:
-                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
-                actor_layers.append(activation)
-        self.actor = nn.Sequential(*actor_layers)
+        self.backbone = backbone
+        if backbone == "MAMBA":
+            self.actor = MambaActor(
+                cin=input_dim_a,
+                cout=num_actions,
+                d_model=64,
+                n_layer=4,
+                d_state=32,
+                d_conv=3,
+                expand=2,
+                headdim=32,
+                chunk_size=32,
+                n_state_buffer=8
+            )
+        elif backbone == "MLP":
+            self.actor = get_mlp_actor(input_dim_a, actor_hidden_dims, num_actions, activation)
+        else:
+            raise NotImplementedError(f"Backbone {backbone} not implemented")
 
         # Value function
         critic_layers = []
@@ -57,7 +97,7 @@ class ActorCritic(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
-        print(f"Actor MLP: {self.actor}")
+        print(f"Actor {backbone}: {self.actor}")
         print(f"Critic MLP: {self.critic}")
 
         # Action noise
@@ -66,9 +106,8 @@ class ActorCritic(nn.Module):
         # disable args validation for speedup
         Normal.set_default_validate_args = False
 
-        # seems that we get better performance without init
-        # self.init_memory_weights(self.memory_a, 0.001, 0.)
-        # self.init_memory_weights(self.memory_c, 0.001, 0.)
+        # Buffer for recurrent policies
+        self.register_buffer('buffer', None)
 
     @staticmethod
     # not used at the moment
@@ -79,7 +118,8 @@ class ActorCritic(nn.Module):
         ]
 
     def reset(self, dones=None):
-        pass
+        # Reset buffer for recurrent policies
+        self.buffer = None
 
     def forward(self):
         raise NotImplementedError
@@ -97,8 +137,17 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations):
-        mean = self.actor(observations)
+        if self.buffer is None or self.buffer.shape[0] != observations.shape[0]:
+            # Create buffer for recurrent policies
+            self.buffer = observations.unsqueeze(2).repeat(1, 1, self.actor.n_state_buffer)
+        
+        # forward pass, get the mean and the updated buffer
+        mean, new_buffer = self.actor(observations, self.buffer)  # mean: [cout], new_buffer: [buffer_length, cin]
+
+        # update the distribution
         self.distribution = Normal(mean, mean * 0.0 + self.std)
+        # update the buffer, detach to avoid backpropagation
+        self.buffer = new_buffer.detach()
 
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
@@ -108,12 +157,31 @@ class ActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
-        actions_mean = self.actor(observations)
+        if self.buffer is None or self.buffer.shape[0] != observations.shape[0]:
+            # Create buffer for recurrent policies
+            self.buffer = observations.unsqueeze(2).repeat(1, 1, self.actor.n_state_buffer)
+
+        # forward pass, get the mean and the updated buffer
+        actions_mean, new_buffer = self.actor(observations, self.buffer)
+        # update the buffer, detach to avoid backpropagation
+        self.buffer = new_buffer.detach()
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
         value = self.critic(critic_observations)
         return value
+    
+def get_mlp_actor(input_dim, actor_hidden_dims, num_actions, activation):
+    actor_layers = []
+    actor_layers.append(nn.Linear(input_dim, actor_hidden_dims[0]))
+    actor_layers.append(activation)
+    for layer_index in range(len(actor_hidden_dims)):
+        if layer_index == len(actor_hidden_dims) - 1:
+            actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+        else:
+            actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
+            actor_layers.append(activation)
+    return nn.Sequential(*actor_layers)
 
 
 def get_activation(act_name):
