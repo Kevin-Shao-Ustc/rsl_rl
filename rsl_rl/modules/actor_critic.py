@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from torchnssd import BiMamba2
+from torch.nn import functional
+from torchnssd import Mamba2
 
 
 class MambaActor(nn.Module):
@@ -15,29 +16,27 @@ class MambaActor(nn.Module):
         self, cin, cout, d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size, n_state_buffer,
     ):
         super(MambaActor, self).__init__()
-        self.bimamba2 = BiMamba2(
-            cin=cin, cout=cout, d_model=d_model, n_layer=n_layer, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim, chunk_size=chunk_size
-        )
-        self.output_linear = nn.Linear(n_state_buffer, 1)
+        self.input_linear = nn.Linear(cin, d_model, bias=False)
+        self.mamba2 = Mamba2(d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size, )
+        self.output_linear = nn.Linear(d_model, cout, bias=False)
         self.n_state_buffer = n_state_buffer
 
-    def forward(self, x, buffer):
+    def forward(self, buffer):
         '''
-        x [batch_size, cin]
-        buffer [batch_size, cin, n_state_buffer]
+        buffer [batch_size, n_state_buffer, cin]
         y [batch_size, cout]
         '''
-        # add the new input to the buffer
-        buffer = torch.cat([buffer, x.unsqueeze(2)], dim=2)
-        # remove the oldest input from the buffer
-        buffer = buffer[:, :, -self.n_state_buffer:]
-
+        l = buffer.shape[1]
+        buffer = functional.pad(buffer, (0, 0, 0, (64 - buffer.shape[1] % 64) % 64))
         # forward pass
-        y = self.bimamba2(buffer)  # y [batch_size, cout, n_state_buffer]
+        y = self.input_linear(buffer)    # y [batch_size, n_state_buffer, d_model]
+        y = self.mamba2(y)     # y [batch_size, n_state_buffer, d_model]
         
-        y = self.output_linear(y).squeeze(2) # y [batch_size, cout]
+        y = self.output_linear(y)   # y [batch_size, n_state_buffer, cout]
+        
+        y = y[:, -1, :].squeeze(1)     # y [batch_size, cout]
 
-        return y, buffer
+        return y
 
 
 class ActorCritic(nn.Module):
@@ -78,7 +77,7 @@ class ActorCritic(nn.Module):
                 expand=2,
                 headdim=32,
                 chunk_size=32,
-                n_state_buffer=8
+                n_state_buffer=64
             )
         elif backbone == "MLP":
             self.actor = get_mlp_actor(input_dim_a, actor_hidden_dims, num_actions, activation)
@@ -139,15 +138,15 @@ class ActorCritic(nn.Module):
     def update_distribution(self, observations):
         if self.buffer is None or self.buffer.shape[0] != observations.shape[0]:
             # Create buffer for recurrent policies
-            self.buffer = observations.unsqueeze(2).repeat(1, 1, self.actor.n_state_buffer)
+            self.buffer = observations.unsqueeze(1).repeat(1, self.actor.n_state_buffer, 1)
+        # update buffer
+        self.buffer = torch.cat([self.buffer, observations.unsqueeze(1)], dim=1)[:, -self.actor.n_state_buffer:, :]
         
         # forward pass, get the mean and the updated buffer
-        mean, new_buffer = self.actor(observations, self.buffer)  # mean: [cout], new_buffer: [buffer_length, cin]
+        mean = self.actor(self.buffer)  # mean: [batch_size, cout]
 
         # update the distribution
         self.distribution = Normal(mean, mean * 0.0 + self.std)
-        # update the buffer, detach to avoid backpropagation
-        self.buffer = new_buffer.detach()
 
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
@@ -159,13 +158,14 @@ class ActorCritic(nn.Module):
     def act_inference(self, observations):
         if self.buffer is None or self.buffer.shape[0] != observations.shape[0]:
             # Create buffer for recurrent policies
-            self.buffer = observations.unsqueeze(2).repeat(1, 1, self.actor.n_state_buffer)
-
+            self.buffer = observations.unsqueeze(1).repeat(1, self.actor.n_state_buffer, 1)
+        # update buffer
+        self.buffer = torch.cat([self.buffer, observations.unsqueeze(1)], dim=1)[:, -self.actor.n_state_buffer:, :]
+        
         # forward pass, get the mean and the updated buffer
-        actions_mean, new_buffer = self.actor(observations, self.buffer)
-        # update the buffer, detach to avoid backpropagation
-        self.buffer = new_buffer.detach()
-        return actions_mean
+        mean = self.actor(self.buffer)  # mean: [batch_size, cout]
+        
+        return mean
 
     def evaluate(self, critic_observations, **kwargs):
         value = self.critic(critic_observations)
