@@ -13,29 +13,43 @@ from torchnssd import Mamba2
 
 class MambaActor(nn.Module):
     def __init__(
-        self, cin, cout, d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size, n_state_buffer,
+        self, cin, cout, d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size,
     ):
         super(MambaActor, self).__init__()
         self.input_linear = nn.Linear(cin, d_model, bias=False)
         self.mamba2 = Mamba2(d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size, )
-        self.output_linear = nn.Linear(d_model, cout, bias=False)
-        self.n_state_buffer = n_state_buffer
+        self.mlp_1 = nn.Linear(d_model, 512, bias=False)
+        self.mlp_2 = nn.Linear(512, 256, bias=False)
+        self.mlp_3 = nn.Linear(256, 128, bias=False)
+        self.mlp_4 = nn.Linear(128, cout, bias=False)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.activation = nn.ELU()
+        
+        self.chunk_size = chunk_size
 
-    def forward(self, buffer):
+    def forward(self, observations):
         '''
-        buffer [batch_size, n_state_buffer, cin]
+        observations [batch_size, n_state_buffer, cin]
         y [batch_size, cout]
         '''
-        l = buffer.shape[1]
-        buffer = functional.pad(buffer, (0, 0, 0, (64 - buffer.shape[1] % 64) % 64))
+        l = observations.shape[1]
+        observations = functional.pad(observations, (0, 0, 0, (self.chunk_size - observations.shape[1] % self.chunk_size) % self.chunk_size))
         # forward pass
-        y = self.input_linear(buffer)    # y [batch_size, n_state_buffer, d_model]
+        y = self.input_linear(observations)    # y [batch_size, n_state_buffer, d_model]
+        y = self.norm1(y)
+        residual = y[:, -1, :]  # residual [batch_size, 1, d_model]
         y = self.mamba2(y)     # y [batch_size, n_state_buffer, d_model]
+        y = y[:, -1, :].squeeze(1)     # y [batch_size, d_model]
+        y = self.norm1(y)
+        y = self.activation(y + residual)   # y [batch_size, d_model]
+        y = self.mlp_1(y)           # y[batch_size, 512]
+        y = self.activation(y)      # y[batch_size, 512]
+        y = self.mlp_2(y)           # y[batch_size, 256]
+        y = self.activation(y)      # y[batch_size, 256]
+        y = self.mlp_3(y)           # y[batch_size, 128]
+        y = self.activation(y)      # y[batch_size, 128]
+        y = self.mlp_4(y)           # y[batch_size, cout]
         
-        y = self.output_linear(y)   # y [batch_size, n_state_buffer, cout]
-        
-        y = y[:, -1, :].squeeze(1)     # y [batch_size, cout]
-
         return y
 
 
@@ -51,6 +65,7 @@ class ActorCritic(nn.Module):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         init_noise_std=1.0,
+        buffer_size = 1,
         backbone="MAMBA",
         **kwargs,
     ):
@@ -64,20 +79,21 @@ class ActorCritic(nn.Module):
 
         input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
+        self.actor_obs_size = num_actor_obs
+        self.buffer_size = buffer_size
         # Policy
         self.backbone = backbone
         if backbone == "MAMBA":
             self.actor = MambaActor(
                 cin=input_dim_a,
                 cout=num_actions,
-                d_model=64,
+                d_model=32,
                 n_layer=4,
                 d_state=32,
                 d_conv=3,
                 expand=2,
-                headdim=32,
-                chunk_size=32,
-                n_state_buffer=64
+                headdim=16,
+                chunk_size=8,
             )
         elif backbone == "MLP":
             self.actor = get_mlp_actor(input_dim_a, actor_hidden_dims, num_actions, activation)
@@ -105,9 +121,6 @@ class ActorCritic(nn.Module):
         # disable args validation for speedup
         Normal.set_default_validate_args = False
 
-        # Buffer for recurrent policies
-        self.register_buffer('buffer', None)
-
     @staticmethod
     # not used at the moment
     def init_weights(sequential, scales):
@@ -117,8 +130,7 @@ class ActorCritic(nn.Module):
         ]
 
     def reset(self, dones=None):
-        # Reset buffer for recurrent policies
-        self.buffer = None
+        pass
 
     def forward(self):
         raise NotImplementedError
@@ -136,14 +148,9 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations):
-        if self.buffer is None or self.buffer.shape[0] != observations.shape[0]:
-            # Create buffer for recurrent policies
-            self.buffer = observations.unsqueeze(1).repeat(1, self.actor.n_state_buffer, 1)
-        # update buffer
-        self.buffer = torch.cat([self.buffer, observations.unsqueeze(1)], dim=1)[:, -self.actor.n_state_buffer:, :]
-        
-        # forward pass, get the mean and the updated buffer
-        mean = self.actor(self.buffer)  # mean: [batch_size, cout]
+        obs_reformed = observations.view(-1, self.buffer_size, self.actor_obs_size)
+        # forward pass, get the mean
+        mean = self.actor(obs_reformed)  # mean: [batch_size, cout]
 
         # update the distribution
         self.distribution = Normal(mean, mean * 0.0 + self.std)
@@ -156,14 +163,9 @@ class ActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
-        if self.buffer is None or self.buffer.shape[0] != observations.shape[0]:
-            # Create buffer for recurrent policies
-            self.buffer = observations.unsqueeze(1).repeat(1, self.actor.n_state_buffer, 1)
-        # update buffer
-        self.buffer = torch.cat([self.buffer, observations.unsqueeze(1)], dim=1)[:, -self.actor.n_state_buffer:, :]
-        
-        # forward pass, get the mean and the updated buffer
-        mean = self.actor(self.buffer)  # mean: [batch_size, cout]
+        obs_reformed = observations.view(-1, self.buffer_size, self.actor_obs_size)
+        # forward pass, get the mean
+        mean = self.actor(obs_reformed)  # mean: [batch_size, cout]
         
         return mean
 
