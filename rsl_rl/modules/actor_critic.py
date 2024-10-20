@@ -16,7 +16,7 @@ class MambaActor(nn.Module):
         self, cin, cout, d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size,
     ):
         super(MambaActor, self).__init__()
-        self.input_linear = nn.Linear(cin, d_model, bias=False)
+        # self.input_linear = nn.Linear(cin, d_model, bias=False)
         self.mamba2 = Mamba2(d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size, )
         # self.mlp_1 = nn.Linear(d_model, 128, bias=False)
         # self.mlp_2 = nn.Linear(128, 64, bias=False)
@@ -35,10 +35,9 @@ class MambaActor(nn.Module):
         l = observations.shape[1]
         observations = functional.pad(observations, (0, 0, 0, (self.chunk_size - observations.shape[1] % self.chunk_size) % self.chunk_size))
         # forward pass
-        y = self.input_linear(observations)    # y [batch_size, n_state_buffer, d_model]
-        y = self.norm1(y)
-        residual = y[:, -1, :]  # residual [batch_size, 1, d_model]
-        y = self.mamba2(y)     # y [batch_size, n_state_buffer, d_model]
+        # y = self.input_linear(observations)    # y [batch_size, n_state_buffer, d_model]
+        # y = self.activation(y)
+        y = self.mamba2(observations)     # y [batch_size, n_state_buffer, d_model]
         y = y[:, -1, :].squeeze(1)     # y [batch_size, d_model]
         y = self.activation(y)
         y = self.output_linear(y)
@@ -87,7 +86,7 @@ class ActorCritic(nn.Module):
             self.actor = MambaActor(
                 cin=input_dim_a,
                 cout=num_actions,
-                d_model=32,
+                d_model=input_dim_a,
                 n_layer=4,
                 d_state=32,
                 d_conv=3,
