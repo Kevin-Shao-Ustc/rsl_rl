@@ -18,10 +18,10 @@ class MambaActor(nn.Module):
         super(MambaActor, self).__init__()
         self.input_linear = nn.Linear(cin, d_model, bias=False)
         self.mamba2 = Mamba2(d_model, n_layer, d_state, d_conv, expand, headdim, chunk_size, )
-        self.mlp_1 = nn.Linear(d_model, 512, bias=False)
-        self.mlp_2 = nn.Linear(512, 256, bias=False)
-        self.mlp_3 = nn.Linear(256, 128, bias=False)
-        self.mlp_4 = nn.Linear(128, cout, bias=False)
+        # self.mlp_1 = nn.Linear(d_model, 128, bias=False)
+        # self.mlp_2 = nn.Linear(128, 64, bias=False)
+        # self.mlp_3 = nn.Linear(64, cout, bias=False)
+        self.output_linear = nn.Linear(d_model, cout, bias = False)
         self.norm1 = nn.LayerNorm(d_model)
         self.activation = nn.ELU()
         
@@ -40,15 +40,15 @@ class MambaActor(nn.Module):
         residual = y[:, -1, :]  # residual [batch_size, 1, d_model]
         y = self.mamba2(y)     # y [batch_size, n_state_buffer, d_model]
         y = y[:, -1, :].squeeze(1)     # y [batch_size, d_model]
-        y = self.norm1(y)
-        y = self.activation(y + residual)   # y [batch_size, d_model]
-        y = self.mlp_1(y)           # y[batch_size, 512]
-        y = self.activation(y)      # y[batch_size, 512]
-        y = self.mlp_2(y)           # y[batch_size, 256]
-        y = self.activation(y)      # y[batch_size, 256]
-        y = self.mlp_3(y)           # y[batch_size, 128]
-        y = self.activation(y)      # y[batch_size, 128]
-        y = self.mlp_4(y)           # y[batch_size, cout]
+        y = self.activation(y)
+        y = self.output_linear(y)
+        # y = self.norm1(y)
+        # y = self.activation(y + residual)   # y [batch_size, d_model]
+        # y = self.mlp_1(y)           # y[batch_size, 256]
+        # y = self.activation(y)      # y[batch_size, 256]
+        # y = self.mlp_2(y)           # y[batch_size, 128]
+        # y = self.activation(y)      # y[batch_size, 128]
+        # y = self.mlp_3(y)           # y[batch_size, cout]
         
         return y
 
