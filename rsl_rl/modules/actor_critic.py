@@ -39,6 +39,8 @@ class ActorCritic(nn.Module):
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
+                # Add normalization before the last layer
+                actor_layers.append(nn.LayerNorm(actor_hidden_dims[layer_index]))
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
@@ -51,6 +53,8 @@ class ActorCritic(nn.Module):
         critic_layers.append(activation)
         for layer_index in range(len(critic_hidden_dims)):
             if layer_index == len(critic_hidden_dims) - 1:
+                # Add normalization before the last layer
+                critic_layers.append(nn.LayerNorm(critic_hidden_dims[layer_index]))
                 critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
             else:
                 critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
