@@ -20,8 +20,6 @@ from rsl_rl.utils import store_code_state
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
-    BUFFER_SIZE = 16  # define buffer size. TODO: set buffer size from configuration
-
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
@@ -36,7 +34,7 @@ class OnPolicyRunner:
             num_critic_obs = num_obs
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
-            num_obs, num_critic_obs, self.env.num_actions, buffer_size = self.BUFFER_SIZE, **self.policy_cfg
+            num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
@@ -53,12 +51,10 @@ class OnPolicyRunner:
         self.alg.init_storage(
             self.env.num_envs,
             self.num_steps_per_env,
-            [num_obs * self.BUFFER_SIZE],
+            [num_obs],
             [num_critic_obs],
             [self.env.num_actions],
         )
-
-        self.initialize_buffers(obs)
 
         # Log
         self.log_dir = log_dir
@@ -67,19 +63,6 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
-
-    def initialize_buffers(self, initial_obs):
-        """initialize buffer for all environments, repeat the current observation BUFFER_SIZE times."""
-        # initial_obs: shape (num_envs, num_obs)
-        repeated_obs = initial_obs.unsqueeze(1).repeat(1, self.BUFFER_SIZE, 1)  # shape: (num_envs, BUFFER_SIZE, num_obs)
-        self.buffers = repeated_obs.to(self.device).clone()
-
-    def reset_buffer(self, env_indices, last_obs):
-        """reset buffer if some environment are terminated."""
-        # env_indices: 1D tensor containing indices of environments to reset
-        # last_obs: shape (num_resets, num_obs)
-        reset_obs = last_obs.unsqueeze(1).repeat(1, self.BUFFER_SIZE, 1)  # shape: (num_resets, BUFFER_SIZE, num_obs)
-        self.buffers[env_indices, :] = reset_obs.to(self.device)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -110,9 +93,6 @@ class OnPolicyRunner:
         obs, extras = self.env.get_observations()
         critic_obs = extras["observations"].get("critic", obs)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
-
-        self.initialize_buffers(obs)
-
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -128,8 +108,7 @@ class OnPolicyRunner:
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    # select actions based on buffered observations
-                    actions = self.alg.act(self.buffers.view(self.env.num_envs, -1), critic_obs)
+                    actions = self.alg.act(obs, critic_obs)
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # move to the right device
                     obs, critic_obs, rewards, dones = (
@@ -146,15 +125,6 @@ class OnPolicyRunner:
                         critic_obs = obs
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
-
-                    # update buffer
-                    self.buffers = torch.cat((self.buffers[:, 1:, :], obs.unsqueeze(1)), dim=1)
-
-                    # reset buffer is any environment is terminated
-                    if dones.any():
-                        done_indices = dones.nonzero(as_tuple=False).squeeze(-1)
-                        last_obs = obs[dones > 0]
-                        self.reset_buffer(done_indices, last_obs)
 
                     if self.log_dir is not None:
                         # Book keeping
