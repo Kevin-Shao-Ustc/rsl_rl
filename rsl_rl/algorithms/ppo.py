@@ -10,6 +10,29 @@ import torch.optim as optim
 from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage
 
+from torch.utils.data import Dataset, DataLoader
+import joblib
+
+import random
+from itertools import islice
+
+class ObsActDataset(Dataset):
+    def __init__(self, data_dict):
+        """
+        Initializes the dataset with observation and action tensors.
+        
+        Args:
+            data_dict (dict): Dictionary containing 'obs' and 'act' tensors.
+        """
+        assert 'obs' in data_dict and 'act' in data_dict, "Dataset must have 'obs' and 'act' keys."
+        self.obs = data_dict['obs']
+        self.act = data_dict['act']
+        
+    def __len__(self):
+        return self.obs.size(0)
+    
+    def __getitem__(self, idx):
+        return self.obs[idx], self.act[idx]
 
 class PPO:
     actor_critic: ActorCritic
@@ -54,6 +77,18 @@ class PPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        
+        # BC data
+        dataset_path = "/home/yshao/2024/ws_distill/policy_distillation/data/combined_dataset.pkl"
+        data_dict = joblib.load(dataset_path)
+        dataset = ObsActDataset(data_dict)
+        batch_size = 1024
+        self.train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        self.criterion = nn.MSELoss()
+        self.bc_weight = 1.0
+        self.num_update_batches = int(0.1 * len(dataset) / batch_size)
+        self.loader_iterator = iter(self.train_loader)
+        
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.storage = RolloutStorage(
@@ -176,6 +211,23 @@ class PPO:
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
+            
+        # TODO: use BC loss in finetuning
+        # BC loss
+        # for _ in range(self.num_update_batches):
+        #     try:
+        #         batch_obs, batch_act = next(self.loader_iterator)
+        #     except StopIteration:
+        #         self.loader_iterator = iter(self.train_loader)
+        #         batch_obs, batch_act = next(self.loader_iterator)
+        #     batch_obs = batch_obs.to(self.device)
+        #     batch_act = batch_act.to(self.device)
+        #     self.optimizer.zero_grad()
+        #     self.actor_critic.update_distribution(batch_obs)
+        #     pred_act = self.actor_critic.action_mean
+        #     loss = self.bc_weight * self.criterion(pred_act, batch_act)
+        #     loss.backward()
+        #     self.optimizer.step()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
